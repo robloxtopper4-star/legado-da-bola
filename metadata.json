@@ -1,0 +1,7 @@
+{
+  "name": "Legado da Bola - Carreira Pro",
+  "description": "Simulador de carreira de jogador de futebol completo, realista e imersivo. Crie seu jogador, evolua atributos, receba propostas, conquiste títulos e a Bola de Ouro.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
