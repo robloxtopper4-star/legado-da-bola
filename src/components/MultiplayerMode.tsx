@@ -10,13 +10,10 @@ import {
   CheckCircle2,
   Clock,
   Play,
-  Sparkles,
   Wifi,
-  WifiOff,
   RotateCcw,
   Trophy,
-  Edit3,
-  Gamepad2
+  Edit3
 } from 'lucide-react';
 import { Club } from '../types';
 import { INITIAL_CLUBS } from '../data/database';
@@ -36,17 +33,29 @@ import {
 import { soundFx } from '../utils/audio';
 
 interface MultiplayerPlayerState {
+  id?: string;
+  role?: 'host' | 'guest';
   name: string;
   clubId: string;
   squadType: 'original' | 'custom';
   customSquadName: string;
   roster: Club2DRosterItem[];
   ready: boolean;
+  connected?: boolean;
 }
 
 interface RoomStatePayload {
+  roomId: string;
   code: string;
   status: 'lobby' | 'playing' | 'ended';
+  player1: MultiplayerPlayerState;
+  player2: MultiplayerPlayerState | null;
+  player1Team: string;
+  player2Team: string | null;
+  player1Ready: boolean;
+  player2Ready: boolean;
+  gameStarted: boolean;
+  gameState?: any;
   host: MultiplayerPlayerState;
   guest: MultiplayerPlayerState | null;
 }
@@ -56,15 +65,34 @@ interface MultiplayerModeProps {
   onOpenSquadEditor: () => void;
 }
 
+function getOrCreateSessionPlayerId(): string {
+  try {
+    const existing = sessionStorage.getItem('carreira_mp_session_player_id');
+    if (existing) return existing;
+    const created = `mp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    sessionStorage.setItem('carreira_mp_session_player_id', created);
+    return created;
+  } catch {
+    return `mp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  }
+}
+
 export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
   onBackToMenu,
   onOpenSquadEditor
 }) => {
+  const [playerId] = useState<string>(() => getOrCreateSessionPlayerId());
   const [playerName, setPlayerName] = useState<string>(() => {
-    return localStorage.getItem('carreira_mp_player_name') || 'Jogador 1';
+    try {
+      return localStorage.getItem('carreira_mp_player_name') || 'Jogador 1';
+    } catch {
+      return 'Jogador 1';
+    }
   });
   const [joinCodeInput, setJoinCodeInput] = useState<string>('');
   const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [serverReachable, setServerReachable] = useState<boolean>(true);
+  const [isBusy, setIsBusy] = useState<boolean>(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [infoBanner, setInfoBanner] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
@@ -72,7 +100,17 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
   const [role, setRole] = useState<'host' | 'guest' | null>(null);
   const [roomState, setRoomState] = useState<RoomStatePayload | null>(null);
 
-  // Local Lobby Selections before syncing to server
+  const roleRef = useRef<'host' | 'guest' | null>(null);
+  useEffect(() => {
+    roleRef.current = role;
+  }, [role]);
+
+  const roomStateRef = useRef<RoomStatePayload | null>(null);
+  useEffect(() => {
+    roomStateRef.current = roomState;
+  }, [roomState]);
+
+  // Local Lobby Selections
   const [selectedClubId, setSelectedClubId] = useState<string>(INITIAL_CLUBS[0].id);
   const [selectedSquadOption, setSelectedSquadOption] = useState<string>('original');
   const [countryFilter, setCountryFilter] = useState<string>('all');
@@ -102,8 +140,14 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
   const wsRef = useRef<WebSocket | null>(null);
   const listenersRef = useRef<Set<(msg: any) => void>>(new Set());
   const prevGuestPresentRef = useRef<boolean>(false);
+  const prevRoomStatusRef = useRef<string>('lobby');
 
-  // Refresh custom squads when entering lobby
+  // Buffers for hybrid HTTP + WS real-time match sync
+  const latestHostStateRef = useRef<any | null>(null);
+  const latestFinishedResultRef = useRef<any | null>(null);
+  const latestGuestInputRef = useRef<any | null>(null);
+  const pendingGuestActionsBufferRef = useRef<any[]>([]);
+
   useEffect(() => {
     setCustomSquads(loadCustomSquads());
   }, []);
@@ -122,7 +166,36 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
     }, 4000);
   }, []);
 
-  // Connect WebSocket
+  const applyIncomingRoomState = useCallback(
+    (incomingRoom: RoomStatePayload) => {
+      if (!incomingRoom) return;
+      const hadGuest = prevGuestPresentRef.current;
+      const hasGuestNow = Boolean(incomingRoom.guest || incomingRoom.player2);
+      if (!hadGuest && hasGuestNow && roleRef.current === 'host') {
+        const gName = incomingRoom.guest?.name || incomingRoom.player2?.name || 'Jogador 2';
+        soundFx.playCheer();
+        showInfo(`🎉 ${gName} entrou na sala! Escolham seus times e confirmem.`);
+      }
+      prevGuestPresentRef.current = hasGuestNow;
+
+      const prevStatus = prevRoomStatusRef.current;
+      if (prevStatus !== 'playing' && incomingRoom.status === 'playing') {
+        setHomeScore(0);
+        setAwayScore(0);
+        setEvents([]);
+        latestHostStateRef.current = null;
+        latestFinishedResultRef.current = null;
+        pendingGuestActionsBufferRef.current = [];
+        setMatchKey(k => k + 1);
+        soundFx.playWhistle();
+      }
+      prevRoomStatusRef.current = incomingRoom.status;
+      setRoomState(incomingRoom);
+    },
+    [showInfo]
+  );
+
+  // Connect WebSocket for ultra-low latency events (automatically paired with REST fallback)
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -132,79 +205,84 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
 
     const connect = () => {
       if (isUnmounted) return;
-      socket = new WebSocket(wsUrl);
-      wsRef.current = socket;
+      try {
+        socket = new WebSocket(wsUrl);
+        wsRef.current = socket;
 
-      socket.onopen = () => {
-        if (isUnmounted) return;
-        setWsConnected(true);
-      };
-
-      socket.onmessage = event => {
-        if (isUnmounted) return;
-        try {
-          const msg = JSON.parse(event.data);
-
-          // Notify pitch listeners first for ultra-low latency
-          listenersRef.current.forEach(fn => fn(msg));
-
-          if (msg.type === 'room_created') {
-            setRole(msg.role);
-            setRoomState(msg.room);
-            prevGuestPresentRef.current = Boolean(msg.room?.guest);
-            soundFx.playSuccess();
-            showInfo(`✅ Sala ${msg.room.code} criada! Compartilhe o código com o Jogador 2.`);
-          } else if (msg.type === 'room_joined') {
-            setRole(msg.role);
-            setRoomState(msg.room);
-            prevGuestPresentRef.current = true;
-            soundFx.playSuccess();
-            showInfo(`✅ Você entrou na sala ${msg.room.code} como Jogador 2!`);
-          } else if (msg.type === 'room_state') {
-            const hadGuest = prevGuestPresentRef.current;
-            const hasGuestNow = Boolean(msg.room?.guest);
-            if (!hadGuest && hasGuestNow) {
-              soundFx.playCheer();
-              showInfo(`🎉 ${msg.room.guest.name} entrou na sala! Escolham seus times e confirmem.`);
-            }
-            prevGuestPresentRef.current = hasGuestNow;
-            setRoomState(msg.room);
-          } else if (msg.type === 'match_started') {
-            setRoomState(msg.room);
-            setHomeScore(0);
-            setAwayScore(0);
-            setEvents([]);
-            setMatchKey(k => k + 1);
-            soundFx.playWhistle();
-          } else if (msg.type === 'mp_match_finished' && msg.result) {
-            setHomeScore(msg.result.homeScore);
-            setAwayScore(msg.result.awayScore);
-            setEvents(msg.result.events || []);
-            if (msg.result.stats) setStats(msg.result.stats);
-            setRoomState(prev => (prev ? { ...prev, status: 'ended' } : prev));
-          } else if (msg.type === 'player_disconnected') {
-            showError(msg.message || 'O outro jogador desconectou da sala.');
-            if (msg.room) {
-              prevGuestPresentRef.current = Boolean(msg.room.guest);
-              setRoomState(msg.room);
-            } else {
-              setRoomState(null);
-              setRole(null);
-            }
-          } else if (msg.type === 'error_msg') {
-            soundFx.playClick();
-            showError(msg.message || 'Erro na sala multiplayer.');
+        socket.onopen = () => {
+          if (isUnmounted) return;
+          setWsConnected(true);
+          setServerReachable(true);
+          // Re-bind to active room if already in a room
+          if (roomStateRef.current?.code && roleRef.current) {
+            socket?.send(
+              JSON.stringify({
+                type: 'bind_socket',
+                code: roomStateRef.current.code,
+                role: roleRef.current,
+                playerId
+              })
+            );
           }
-        } catch {
-          // Ignore malformed JSON
-        }
-      };
+        };
 
-      socket.onclose = () => {
-        if (isUnmounted) return;
-        setWsConnected(false);
-        reconnectTimer = setTimeout(connect, 2000);
-      };
+        socket.onmessage = event => {
+          if (isUnmounted) return;
+          try {
+            const msg = JSON.parse(event.data);
+
+            // Notify pitch listeners first for immediate frame update
+            listenersRef.current.forEach(fn => fn(msg));
+
+            if (msg.type === 'room_created') {
+              setRole(msg.role);
+              prevGuestPresentRef.current = Boolean(msg.room?.guest);
+              prevRoomStatusRef.current = msg.room?.status || 'lobby';
+              setRoomState(msg.room);
+            } else if (msg.type === 'room_joined') {
+              setRole(msg.role);
+              prevGuestPresentRef.current = true;
+              prevRoomStatusRef.current = msg.room?.status || 'lobby';
+              setRoomState(msg.room);
+            } else if (msg.type === 'room_state' && msg.room) {
+              applyIncomingRoomState(msg.room);
+            } else if (msg.type === 'match_started' && msg.room) {
+              applyIncomingRoomState(msg.room);
+            } else if (msg.type === 'mp_match_finished' && msg.result) {
+              setHomeScore(msg.result.homeScore);
+              setAwayScore(msg.result.awayScore);
+              setEvents(msg.result.events || []);
+              if (msg.result.stats) setStats(msg.result.stats);
+              prevRoomStatusRef.current = 'ended';
+              setRoomState(prev => (prev ? { ...prev, status: 'ended', gameStarted: false } : prev));
+            } else if (msg.type === 'player_disconnected') {
+              showError(msg.message || 'O outro jogador desconectou da sala.');
+              if (msg.room) {
+                prevGuestPresentRef.current = Boolean(msg.room.guest);
+                prevRoomStatusRef.current = msg.room.status;
+                setRoomState(msg.room);
+              } else {
+                prevRoomStatusRef.current = 'lobby';
+                setRoomState(null);
+                setRole(null);
+              }
+            } else if (msg.type === 'error_msg') {
+              soundFx.playClick();
+              showError(msg.message || 'Erro na sala multiplayer.');
+            }
+          } catch {
+            // Ignore malformed JSON
+          }
+        };
+
+        socket.onclose = () => {
+          if (isUnmounted) return;
+          setWsConnected(false);
+          reconnectTimer = setTimeout(connect, 2000);
+        };
+      } catch {
+        reconnectTimer = setTimeout(connect, 2500);
+      }
     };
 
     connect();
@@ -216,11 +294,170 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
         socket.close();
       }
     };
-  }, [showError, showInfo]);
+  }, [applyIncomingRoomState, playerId, showError]);
 
-  const sendWsMessage = useCallback((payload: Record<string, unknown>) => {
+  // Lobby Polling Heartbeat (ensures 100% real-time room state across devices even if WS upgrade is proxied)
+  useEffect(() => {
+    if (!roomState?.code || !role) return;
+    let cancelled = false;
+
+    const pollRoom = async () => {
+      try {
+        const res = await fetch(
+          `/api/mp/room/${encodeURIComponent(roomState.code)}?playerId=${encodeURIComponent(playerId)}`
+        );
+        if (cancelled) return;
+        if (res.status === 404) {
+          showError('A sala foi encerrada.');
+          setRoomState(null);
+          setRole(null);
+          return;
+        }
+        const data = await res.json();
+        if (!cancelled && data.ok && data.room) {
+          setServerReachable(true);
+          applyIncomingRoomState(data.room);
+          if (
+            data.room.status === 'ended' &&
+            data.room.gameState?.finalResult &&
+            prevRoomStatusRef.current === 'ended'
+          ) {
+            const fin = data.room.gameState.finalResult;
+            setHomeScore(fin.homeScore);
+            setAwayScore(fin.awayScore);
+            if (fin.events) setEvents(fin.events);
+            if (fin.stats) setStats(fin.stats);
+          }
+        }
+      } catch {
+        // Ignore transient network hiccup
+      }
+    };
+
+    const intervalMs = roomState.status === 'lobby' ? 750 : 1800;
+    const timer = setInterval(pollRoom, intervalMs);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [applyIncomingRoomState, playerId, role, roomState?.code, roomState?.status, showError]);
+
+  // High-frequency Match State Sync Fallback (/api/mp/sync) while match is playing
+  useEffect(() => {
+    if (!roomState?.code || !role || roomState.status !== 'playing') return;
+    let cancelled = false;
+    let inFlight = false;
+
+    const syncTick = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        if (role === 'host') {
+          const payload: Record<string, unknown> = {
+            code: roomState.code,
+            role: 'host',
+            state: latestHostStateRef.current,
+            finishedResult: latestFinishedResultRef.current
+          };
+          const res = await fetch('/api/mp/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          const data = await res.json();
+          if (!cancelled && data.ok) {
+            if (data.guestInput) {
+              listenersRef.current.forEach(fn =>
+                fn({ type: 'mp_guest_input', input: data.guestInput })
+              );
+            }
+            if (Array.isArray(data.guestActions) && data.guestActions.length > 0) {
+              for (const item of data.guestActions) {
+                if (item && item.payload) {
+                  listenersRef.current.forEach(fn => fn(item.payload));
+                }
+              }
+            }
+          }
+        } else {
+          const actionsToFlush = [...pendingGuestActionsBufferRef.current];
+          pendingGuestActionsBufferRef.current = [];
+          const payload: Record<string, unknown> = {
+            code: roomState.code,
+            role: 'guest',
+            input: latestGuestInputRef.current,
+            actions: actionsToFlush
+          };
+          const res = await fetch('/api/mp/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          const data = await res.json();
+          if (!cancelled && data.ok) {
+            if (data.state) {
+              listenersRef.current.forEach(fn =>
+                fn({ type: 'mp_state_sync', state: data.state })
+              );
+              if (data.state.finalResult) {
+                listenersRef.current.forEach(fn =>
+                  fn({ type: 'mp_match_finished', result: data.state.finalResult })
+                );
+              }
+            }
+            if (data.roomStatus === 'ended' && data.state?.finalResult) {
+              const fin = data.state.finalResult;
+              setHomeScore(fin.homeScore);
+              setAwayScore(fin.awayScore);
+              if (fin.events) setEvents(fin.events);
+              if (fin.stats) setStats(fin.stats);
+              prevRoomStatusRef.current = 'ended';
+              setRoomState(prev =>
+                prev ? { ...prev, status: 'ended', gameStarted: false } : prev
+              );
+            }
+          }
+        }
+      } catch {
+        // Ignore single tick failure
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const interval = setInterval(syncTick, 55);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [role, roomState?.code, roomState?.status]);
+
+  const sendPitchMessage = useCallback((payload: Record<string, unknown>) => {
+    const code = roomStateRef.current?.code || '';
+    const currentRole = roleRef.current || 'host';
+    const enriched = {
+      ...payload,
+      code,
+      role: currentRole
+    };
+
+    // Track latest state/input/actions for hybrid HTTP + WS delivery
+    if (payload.type === 'mp_state_sync' && payload.state) {
+      latestHostStateRef.current = payload.state;
+    } else if (payload.type === 'mp_match_finished' && payload.result) {
+      latestFinishedResultRef.current = payload.result;
+    } else if (payload.type === 'mp_guest_input' && payload.input) {
+      latestGuestInputRef.current = payload.input;
+    } else if (payload.type === 'mp_guest_action') {
+      pendingGuestActionsBufferRef.current.push(enriched);
+    }
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(payload));
+      try {
+        wsRef.current.send(JSON.stringify(enriched));
+      } catch {
+        // Handled by HTTP sync
+      }
     }
   }, []);
 
@@ -238,7 +475,10 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
 
   // Build resolved 11-player 2D roster for the player's current selection
   const buildLocalResolvedRoster = useCallback(
-    (club: Club, squadOpt: string): {
+    (
+      club: Club,
+      squadOpt: string
+    ): {
       squadType: 'original' | 'custom';
       customSquadName: string;
       roster: Club2DRosterItem[];
@@ -267,66 +507,181 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
     [customSquads]
   );
 
-  // Create Room (Jogador 1)
-  const handleCreateRoom = () => {
-    const trimmedName = playerName.trim() || 'Jogador 1';
-    localStorage.setItem('carreira_mp_player_name', trimmedName);
-    const defaultClub = INITIAL_CLUBS[0];
-    setSelectedClubId(defaultClub.id);
-    setSelectedSquadOption('original');
-    const resolved = buildLocalResolvedRoster(defaultClub, 'original');
+  // 1. Create Room (Jogador 1) via Authoritative Server Endpoint + WebSocket bind
+  const handleCreateRoom = async () => {
+    if (isBusy) return;
+    setIsBusy(true);
+    try {
+      const trimmedName = playerName.trim() || 'Jogador 1';
+      try {
+        localStorage.setItem('carreira_mp_player_name', trimmedName);
+      } catch {
+        // Ignore storage error
+      }
+      const defaultClub = INITIAL_CLUBS[0];
+      setSelectedClubId(defaultClub.id);
+      setSelectedSquadOption('original');
+      const resolved = buildLocalResolvedRoster(defaultClub, 'original');
 
-    sendWsMessage({
-      type: 'create_room',
-      name: trimmedName,
-      clubId: defaultClub.id,
-      squadType: resolved.squadType,
-      customSquadName: resolved.customSquadName,
-      roster: resolved.roster
-    });
+      const res = await fetch('/api/mp/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playerId,
+          name: trimmedName,
+          clubId: defaultClub.id,
+          squadType: resolved.squadType,
+          customSquadName: resolved.customSquadName,
+          roster: resolved.roster
+        })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok || !data.room) {
+        showError(data.message || 'Não foi possível criar a sala.');
+        return;
+      }
+
+      setRole('host');
+      roleRef.current = 'host';
+      prevGuestPresentRef.current = Boolean(data.room.guest);
+      prevRoomStatusRef.current = data.room.status;
+      setRoomState(data.room);
+      setServerReachable(true);
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'bind_socket',
+            code: data.room.code,
+            role: 'host',
+            playerId
+          })
+        );
+      }
+
+      soundFx.playSuccess();
+      showInfo(`✅ Sala ${data.room.code} criada! Copie e envie o código para o Jogador 2.`);
+    } catch {
+      showError('Erro de conexão ao criar a sala. Tente novamente.');
+    } finally {
+      setIsBusy(false);
+    }
   };
 
-  // Join Room (Jogador 2)
-  const handleJoinRoom = () => {
+  // 2. Join Room (Jogador 2) via Authoritative Server Endpoint + WebSocket bind
+  const handleJoinRoom = async () => {
     const cleanCode = joinCodeInput.trim().toUpperCase();
     if (!cleanCode) {
       showError('Digite o código da sala para entrar!');
       return;
     }
-    const trimmedName = playerName.trim() || 'Jogador 2';
-    localStorage.setItem('carreira_mp_player_name', trimmedName);
-    const defaultClub = INITIAL_CLUBS[4] || INITIAL_CLUBS[1];
-    setSelectedClubId(defaultClub.id);
-    setSelectedSquadOption('original');
-    const resolved = buildLocalResolvedRoster(defaultClub, 'original');
+    if (isBusy) return;
+    setIsBusy(true);
+    try {
+      const trimmedName =
+        playerName.trim() === 'Jogador 1'
+          ? 'Jogador 2'
+          : playerName.trim() || 'Jogador 2';
+      setPlayerName(trimmedName);
+      try {
+        localStorage.setItem('carreira_mp_player_name', trimmedName);
+      } catch {
+        // Ignore storage error
+      }
+      const defaultClub = INITIAL_CLUBS[4] || INITIAL_CLUBS[1];
+      setSelectedClubId(defaultClub.id);
+      setSelectedSquadOption('original');
+      const resolved = buildLocalResolvedRoster(defaultClub, 'original');
 
-    sendWsMessage({
-      type: 'join_room',
-      code: cleanCode,
-      name: trimmedName,
-      clubId: defaultClub.id,
-      squadType: resolved.squadType,
-      customSquadName: resolved.customSquadName,
-      roster: resolved.roster
-    });
+      const res = await fetch('/api/mp/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code: cleanCode,
+          playerId,
+          name: trimmedName,
+          clubId: defaultClub.id,
+          squadType: resolved.squadType,
+          customSquadName: resolved.customSquadName,
+          roster: resolved.roster
+        })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok || !data.room) {
+        soundFx.playClick();
+        showError(data.message || `Sala "${cleanCode}" não encontrada.`);
+        return;
+      }
+
+      const assignedRole: 'host' | 'guest' = data.role === 'host' ? 'host' : 'guest';
+      setRole(assignedRole);
+      roleRef.current = assignedRole;
+      prevGuestPresentRef.current = Boolean(data.room.guest);
+      prevRoomStatusRef.current = data.room.status;
+      setRoomState(data.room);
+      setServerReachable(true);
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'bind_socket',
+            code: data.room.code,
+            role: assignedRole,
+            playerId
+          })
+        );
+      }
+
+      soundFx.playSuccess();
+      showInfo(`✅ Conectado à sala ${data.room.code} como ${assignedRole === 'host' ? 'Jogador 1' : 'Jogador 2'}!`);
+    } catch {
+      showError('Erro ao conectar na sala. Verifique o código e tente novamente.');
+    } finally {
+      setIsBusy(false);
+    }
   };
 
-  // Update Club or Squad in Lobby
+  // Update Club, Squad, or Ready status in Lobby
   const syncLobbySelection = useCallback(
-    (newClubId: string, newSquadOpt: string, newReady?: boolean) => {
+    async (newClubId: string, newSquadOpt: string, newReady?: boolean) => {
+      const currentCode = roomStateRef.current?.code;
+      const currentRole = roleRef.current;
+      if (!currentCode || !currentRole) return;
+
       const clubObj = INITIAL_CLUBS.find(c => c.id === newClubId) || INITIAL_CLUBS[0];
       const resolved = buildLocalResolvedRoster(clubObj, newSquadOpt);
-      sendWsMessage({
+      const payload = {
         type: 'update_lobby',
-        name: playerName.trim() || (role === 'host' ? 'Jogador 1' : 'Jogador 2'),
+        code: currentCode,
+        role: currentRole,
+        playerId,
+        name: playerName.trim() || (currentRole === 'host' ? 'Jogador 1' : 'Jogador 2'),
         clubId: clubObj.id,
         squadType: resolved.squadType,
         customSquadName: resolved.customSquadName,
         roster: resolved.roster,
         ready: newReady !== undefined ? newReady : false
-      });
+      };
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify(payload));
+      }
+
+      try {
+        const res = await fetch('/api/mp/lobby', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.ok && data.room) {
+          applyIncomingRoomState(data.room);
+        }
+      } catch {
+        // Handled by WS or next poll
+      }
     },
-    [buildLocalResolvedRoster, playerName, role, sendWsMessage]
+    [applyIncomingRoomState, buildLocalResolvedRoster, playerId, playerName]
   );
 
   const handleSelectClubInLobby = (club: Club) => {
@@ -350,20 +705,60 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
     syncLobbySelection(selectedClubId, selectedSquadOption, !isMyReady);
   };
 
-  const handleStartOnlineMatch = () => {
-    if (!bothReady) {
+  const handleStartOnlineMatch = async () => {
+    if (!bothReady || !roomState?.code) {
       showError('A partida só pode ser iniciada quando os 2 jogadores confirmarem (Pronto)!');
       return;
     }
     soundFx.playWhistle();
-    sendWsMessage({ type: 'start_match' });
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'start_match',
+          code: roomState.code,
+          role
+        })
+      );
+    }
+    try {
+      const res = await fetch('/api/mp/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: roomState.code, role, playerId })
+      });
+      const data = await res.json();
+      if (data.ok && data.room) {
+        applyIncomingRoomState(data.room);
+      } else if (data.message) {
+        showError(data.message);
+      }
+    } catch {
+      // Handled by WS or poll
+    }
   };
 
-  const handleLeaveRoom = () => {
+  const handleLeaveRoom = async () => {
     soundFx.playClick();
-    sendWsMessage({ type: 'leave_room' });
+    const code = roomState?.code;
+    const currentRole = role;
     setRoomState(null);
     setRole(null);
+    prevRoomStatusRef.current = 'lobby';
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && code) {
+      wsRef.current.send(JSON.stringify({ type: 'leave_room', code, role: currentRole }));
+    }
+    if (code) {
+      try {
+        await fetch('/api/mp/leave', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, role: currentRole, playerId })
+        });
+      } catch {
+        // Ignore leave network error
+      }
+    }
   };
 
   const handleCopyRoomCode = () => {
@@ -422,7 +817,7 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
       roomCode: roomState?.code || '',
       hostPlayerName: roomState?.host?.name || 'Jogador 1',
       guestPlayerName: roomState?.guest?.name || 'Jogador 2',
-      sendMessage: sendWsMessage,
+      sendMessage: sendPitchMessage,
       subscribeMessage: subscribeWsMessage
     }),
     [
@@ -430,10 +825,12 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
       roomState?.code,
       roomState?.host?.name,
       roomState?.guest?.name,
-      sendWsMessage,
+      sendPitchMessage,
       subscribeWsMessage
     ]
   );
+
+  const isOnline = wsConnected || serverReachable;
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 sm:p-6">
@@ -464,20 +861,13 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                 </span>
                 <span
                   className={`px-2 py-0.5 rounded-full text-[10px] font-black flex items-center gap-1 border ${
-                    wsConnected
+                    isOnline
                       ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                      : 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                      : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
                   }`}
                 >
-                  {wsConnected ? (
-                    <>
-                      <Wifi className="w-3 h-3 text-emerald-400" /> Online em Tempo Real
-                    </>
-                  ) : (
-                    <>
-                      <WifiOff className="w-3 h-3 text-rose-400" /> Reconectando...
-                    </>
-                  )}
+                  <Wifi className="w-3 h-3 text-emerald-400" />
+                  <span>{isOnline ? 'Servidor Online em Tempo Real' : 'Sincronizando...'}</span>
                 </span>
               </div>
               <h1 className="text-xl sm:text-2xl font-black text-white font-heading mt-0.5">
@@ -547,18 +937,20 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                   </span>
                   <h2 className="text-2xl font-black text-white font-heading">Criar Sala</h2>
                   <p className="text-xs sm:text-sm text-neutral-300 leading-relaxed">
-                    Gera automaticamente um código único de 5 caracteres (ex: <code className="text-emerald-300 font-black">F7K29</code>) para você copiar e enviar para seu amigo jogar contra você em tempo real.
+                    Gera automaticamente um código único de 5 caracteres (ex:{' '}
+                    <code className="text-emerald-300 font-black">AB7K2</code>) no servidor para
+                    você copiar e enviar para outra pessoa conectar de outro dispositivo ou navegador.
                   </p>
                 </div>
 
                 <button
                   type="button"
                   onClick={handleCreateRoom}
-                  disabled={!wsConnected}
+                  disabled={isBusy}
                   className="w-full py-4 rounded-2xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 disabled:opacity-50 text-neutral-950 font-black text-sm uppercase tracking-wider shadow-xl shadow-emerald-500/25 transition flex items-center justify-center gap-2"
                 >
                   <PlusCircle className="w-5 h-5" />
-                  <span>Criar Sala Agora</span>
+                  <span>{isBusy ? 'Criando Sala...' : 'Criar Sala Agora'}</span>
                 </button>
               </div>
 
@@ -573,7 +965,8 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                   </span>
                   <h2 className="text-2xl font-black text-white font-heading">Entrar em Sala</h2>
                   <p className="text-xs sm:text-sm text-neutral-300 leading-relaxed">
-                    Digite o código da sala recebido do Jogador 1 para entrar imediatamente no mesmo Lobby e escolher seu time e elenco.
+                    Digite o código da sala recebido do Jogador 1 para conectar-se à mesma sala em
+                    tempo real, aparecer no lobby e escolher seu time.
                   </p>
 
                   <div className="pt-2">
@@ -584,7 +977,12 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                       type="text"
                       value={joinCodeInput}
                       onChange={e => setJoinCodeInput(e.target.value.toUpperCase())}
-                      placeholder="Ex: F7K29"
+                      onKeyDown={e => {
+                        if (e.key === 'Enter' && joinCodeInput.trim()) {
+                          handleJoinRoom();
+                        }
+                      }}
+                      placeholder="Ex: AB7K2"
                       maxLength={6}
                       className="w-full px-4 py-3 rounded-xl bg-neutral-950 border-2 border-cyan-500/50 text-white font-black text-lg tracking-[0.25em] uppercase text-center focus:outline-none focus:border-cyan-400"
                     />
@@ -594,11 +992,11 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                 <button
                   type="button"
                   onClick={handleJoinRoom}
-                  disabled={!wsConnected || !joinCodeInput.trim()}
+                  disabled={isBusy || !joinCodeInput.trim()}
                   className="w-full py-4 rounded-2xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 disabled:opacity-50 text-neutral-950 font-black text-sm uppercase tracking-wider shadow-xl shadow-cyan-500/25 transition flex items-center justify-center gap-2"
                 >
                   <LogIn className="w-5 h-5" />
-                  <span>Entrar em Sala</span>
+                  <span>{isBusy ? 'Conectando...' : 'Entrar em Sala'}</span>
                 </button>
               </div>
             </div>
@@ -645,7 +1043,9 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                   <div className="flex items-center justify-center sm:justify-start gap-2">
                     <span
                       className={`w-2.5 h-2.5 rounded-full ${
-                        roomState.guest ? 'bg-emerald-400 animate-ping' : 'bg-amber-400 animate-pulse'
+                        roomState.guest
+                          ? 'bg-emerald-400 animate-ping'
+                          : 'bg-amber-400 animate-pulse'
                       }`}
                     />
                     <span className="text-sm sm:text-base font-black text-white">
@@ -655,7 +1055,8 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                     </span>
                   </div>
                   <p className="text-xs text-neutral-400 mt-1">
-                    Cada jogador escolhe seu clube, seu elenco (Original ou Personalizado) e clica em Confirmar Escolha.
+                    Cada jogador escolhe seu clube, seu elenco (Original ou Personalizado) e clica
+                    em Confirmar Escolha.
                   </p>
                 </div>
               </div>
@@ -828,7 +1229,8 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                   <div className="h-36 flex flex-col items-center justify-center text-center border-2 border-dashed border-neutral-800 rounded-2xl p-4">
                     <Users className="w-8 h-8 text-neutral-600 mb-2 animate-bounce" />
                     <p className="text-xs font-bold text-neutral-400">
-                      Envie o código <strong className="text-amber-300">{roomState.code}</strong> para o Jogador 2 entrar na sala!
+                      Envie o código <strong className="text-amber-300">{roomState.code}</strong>{' '}
+                      para o Jogador 2 entrar na sala!
                     </p>
                   </div>
                 )}
@@ -844,7 +1246,8 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                     Escolha Seu Time e Seu Elenco ({role === 'host' ? 'Jogador 1' : 'Jogador 2'})
                   </h3>
                   <p className="text-xs text-neutral-400">
-                    Você pode jogar com o <strong>Elenco Original</strong> do clube ou escolher qualquer <strong>Elenco Personalizado</strong> salvo.
+                    Você pode jogar com o <strong>Elenco Original</strong> do clube ou escolher
+                    qualquer <strong>Elenco Personalizado</strong> salvo.
                   </p>
                 </div>
 
@@ -984,7 +1387,9 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                   <span className="text-2xl sm:text-4xl font-black text-emerald-400 font-heading">
                     {homeScore}
                   </span>
-                  <span className="text-xs sm:text-sm font-black text-neutral-500 uppercase">X</span>
+                  <span className="text-xs sm:text-sm font-black text-neutral-500 uppercase">
+                    X
+                  </span>
                   <span className="text-2xl sm:text-4xl font-black text-cyan-400 font-heading">
                     {awayScore}
                   </span>
@@ -1037,7 +1442,10 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                   setAwayScore(finalData.awayScore);
                   setEvents(finalData.events);
                   setStats(finalData.stats);
-                  setRoomState(prev => (prev ? { ...prev, status: 'ended' } : prev));
+                  prevRoomStatusRef.current = 'ended';
+                  setRoomState(prev =>
+                    prev ? { ...prev, status: 'ended', gameStarted: false } : prev
+                  );
                 }}
               />
             )}
@@ -1064,13 +1472,29 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({
                   </p>
                 </div>
 
+                {events.length > 0 && (
+                  <div className="max-w-lg mx-auto bg-neutral-950/80 p-4 rounded-2xl border border-neutral-800 text-left space-y-1.5">
+                    <span className="block text-[10px] font-black text-neutral-400 uppercase tracking-wider mb-1">
+                      Resumo de Eventos da Partida ({ stats.homePossession }% x { stats.awayPossession }% posse):
+                    </span>
+                    {events.slice(0, 6).map((ev, idx) => (
+                      <div key={idx} className="text-xs font-bold text-neutral-200">
+                        {ev.text}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 <div className="flex flex-wrap items-center justify-center gap-4">
                   <button
                     type="button"
                     onClick={() => {
                       soundFx.playClick();
+                      prevRoomStatusRef.current = 'lobby';
+                      setRoomState(prev =>
+                        prev ? { ...prev, status: 'lobby', gameStarted: false } : prev
+                      );
                       syncLobbySelection(selectedClubId, selectedSquadOption, false);
-                      setRoomState(prev => (prev ? { ...prev, status: 'lobby' } : prev));
                     }}
                     className="px-6 py-3.5 rounded-2xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-neutral-950 font-black text-xs sm:text-sm uppercase tracking-wider flex items-center gap-2 shadow-xl"
                   >

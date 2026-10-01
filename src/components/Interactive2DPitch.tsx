@@ -443,6 +443,7 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
   const [opponentPlayerId, setOpponentPlayerId] = useState<string>('');
   const awayUserPlayerIdRef = useRef<string>('');
   const guestCallForBallFramesRef = useRef<number>(0);
+  const processedGuestActionIdsRef = useRef<Set<string>>(new Set());
   const guestInputRef = useRef<MultiplayerGuestInput>({
     keys: {},
     mouseX: 50,
@@ -462,6 +463,7 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
     if (multiplayerConfig?.enabled && multiplayerConfig.role === 'guest') {
       multiplayerConfig.sendMessage({
         type: 'mp_guest_action',
+        actionId: `act_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
         action: 'switch_player',
         playerId: newPlayerId
       });
@@ -781,6 +783,7 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
     if (multiplayerConfig?.enabled && multiplayerConfig.role === 'guest') {
       multiplayerConfig.sendMessage({
         type: 'mp_guest_action',
+        actionId: `act_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
         action: 'space'
       });
       setCallBallIndicator(true);
@@ -875,6 +878,7 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
     if (multiplayerConfig?.enabled && multiplayerConfig.role === 'guest') {
       multiplayerConfig.sendMessage({
         type: 'mp_guest_action',
+        actionId: `act_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
         action: 'tackle'
       });
       return;
@@ -931,6 +935,7 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
     if (multiplayerConfig?.enabled && multiplayerConfig.role === 'guest') {
       multiplayerConfig.sendMessage({
         type: 'mp_guest_action',
+        actionId: `act_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
         action: 'dribble'
       });
       return;
@@ -1017,6 +1022,7 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
       if (multiplayerConfig?.enabled && multiplayerConfig.role === 'guest') {
         multiplayerConfig.sendMessage({
           type: 'mp_guest_action',
+          actionId: `act_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
           action: 'shoot',
           targetX: targetPitchX,
           targetY: targetPitchY
@@ -1117,6 +1123,7 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
       if (multiplayerConfig?.enabled && multiplayerConfig.role === 'guest') {
         multiplayerConfig.sendMessage({
           type: 'mp_guest_action',
+          actionId: `act_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
           action: 'pass',
           targetX: targetPitchX,
           targetY: targetPitchY
@@ -1259,6 +1266,16 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
             ...msg.input
           };
         } else if (msg.type === 'mp_guest_action') {
+          if (msg.actionId) {
+            if (processedGuestActionIdsRef.current.has(msg.actionId)) {
+              return;
+            }
+            processedGuestActionIdsRef.current.add(msg.actionId);
+            if (processedGuestActionIdsRef.current.size > 200) {
+              const firstKey = processedGuestActionIdsRef.current.values().next().value;
+              if (firstKey) processedGuestActionIdsRef.current.delete(firstKey);
+            }
+          }
           if (msg.action === 'space') {
             executeCallForBallForActor(true);
           } else if (msg.action === 'tackle') {
@@ -1327,16 +1344,23 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
             setMinute(st.minute);
           }
           if (typeof st.homeScore === 'number' && typeof st.awayScore === 'number') {
-            if (
+            const scoreChanged =
               st.homeScore !== scoresRef.current.home ||
-              st.awayScore !== scoresRef.current.away
-            ) {
+              st.awayScore !== scoresRef.current.away;
+            if (scoreChanged) {
               soundFx.playCheer();
               soundFx.playWhistle();
             }
             scoresRef.current = { home: st.homeScore, away: st.awayScore };
             setHomeScore(st.homeScore);
             setAwayScore(st.awayScore);
+            if (scoreChanged && onMatchEvent && Array.isArray(st.events) && st.events[0]) {
+              onMatchEvent(
+                st.events[0],
+                { homeScore: st.homeScore, awayScore: st.awayScore },
+                st.stats || statsRef.current
+              );
+            }
           }
           if (st.stats) {
             statsRef.current = st.stats;
@@ -1396,12 +1420,16 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
     return () => clearInterval(interval);
   }, [multiplayerConfig]);
 
-  // Main 60 FPS Game Loop (requestAnimationFrame)
+  // Main 60 FPS Game Loop (requestAnimationFrame in single-player; background-safe 60Hz interval for Multiplayer Host)
   useEffect(() => {
-    let animId: number;
+    let animId: number | null = null;
+    let hostIntervalId: ReturnType<typeof setInterval> | null = null;
+    const isMpHost = Boolean(multiplayerConfig?.enabled && multiplayerConfig.role === 'host');
 
     const stepPhysics = () => {
-      animId = requestAnimationFrame(stepPhysics);
+      if (!isMpHost) {
+        animId = requestAnimationFrame(stepPhysics);
+      }
 
       // In Multiplayer, Guest renders state streamed from Host
       if (multiplayerConfig?.enabled && multiplayerConfig.role === 'guest') {
@@ -1715,8 +1743,11 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
           // Closest defender presses the ball / ball carrier!
           // If this bot is on its 3-second tackle cooldown, it jockeys slightly slower
           const cooldownFactor = p.tackleCooldownFrames > 0 ? 0.72 : 1.0;
+          const isUserTeamPressing =
+            (callForBallFramesRef.current > 0 && uPlayer && p.team === uPlayer.team) ||
+            (guestCallForBallFramesRef.current > 0 && guestUPlayer && p.team === guestUPlayer.team);
           const pressBoost =
-            (callForBallFramesRef.current > 0 && uPlayer && p.team === uPlayer.team ? 1.22 : 0.96) *
+            (isUserTeamPressing ? 1.22 : 0.96) *
             cooldownFactor;
           const dx = ball.x - p.x;
           const dy = ball.y - p.y;
@@ -1981,7 +2012,11 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
             }
 
             // Otherwise bot has a realistic chance to steal the ball
-            const stealSuccessChance = currentOwner.id === userPlayerIdRef.current ? 0.45 : 0.58;
+            const isHumanCarrier =
+              currentOwner.id === userPlayerIdRef.current ||
+              (Boolean(multiplayerConfig?.enabled && multiplayerConfig.role === 'host') &&
+                currentOwner.id === awayUserPlayerIdRef.current);
+            const stealSuccessChance = isHumanCarrier ? 0.45 : 0.58;
             if (Math.random() < stealSuccessChance) {
               currentOwner.tackleCooldownFrames = 180; // Dispossessed player also gets 3s cooldown
               ball.ownerId = opp.id;
@@ -1998,6 +2033,15 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
                 opp.team === userTeamSide
               ) {
                 switchControlledPlayer(opp.id);
+              }
+              if (
+                multiplayerConfig?.enabled &&
+                multiplayerConfig.role === 'host' &&
+                guestInputRef.current.teamControlMode &&
+                opp.team === 'away' &&
+                opp.position !== 'GK'
+              ) {
+                switchAwayControlledPlayerOnHost(opp.id);
               }
 
               soundFx.playDeflection();
@@ -2026,15 +2070,18 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
         ball.vy = 0;
       } else {
         // Ball is in flight (pass or shot)
-        // If it's a pass specifically targeted to the user's player, gently home toward user's foot so calling for the ball feels ultra-reliable
-        if (
-          ball.passTargetId &&
-          ball.passTargetId === userPlayerIdRef.current &&
-          uPlayer &&
-          !ball.isShot
-        ) {
-          const dx = uPlayer.x - ball.x;
-          const dy = uPlayer.y - ball.y;
+        // If it's a pass specifically targeted to a human player (P1 or P2), gently home toward their foot
+        const targetHumanPlayer =
+          ball.passTargetId === userPlayerIdRef.current
+            ? uPlayer
+            : multiplayerConfig?.enabled &&
+              multiplayerConfig.role === 'host' &&
+              ball.passTargetId === awayUserPlayerIdRef.current
+            ? guestUPlayer
+            : null;
+        if (targetHumanPlayer && !ball.isShot) {
+          const dx = targetHumanPlayer.x - ball.x;
+          const dy = targetHumanPlayer.y - ball.y;
           const dist = Math.hypot(dx, dy) || 1;
           const currentSpd = Math.hypot(ball.vx, ball.vy) || 1.15;
           ball.vx = (dx / dist) * currentSpd;
@@ -2061,7 +2108,11 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
               // GOALKEEPER SAVE!
               // Calibrated so ~80% of shots within keeper reach are saved, ~20% beat the keeper if well-placed
               const shooter = allPlayers.find(s => s.id === ball.shooterId);
-              const isUserShot = shooter && shooter.id === userPlayerIdRef.current;
+              const isUserShot =
+                shooter &&
+                (shooter.id === userPlayerIdRef.current ||
+                  (Boolean(multiplayerConfig?.enabled && multiplayerConfig.role === 'host') &&
+                    shooter.id === awayUserPlayerIdRef.current));
               const saveChance = isUserShot ? 0.65 : 0.84;
 
               if (Math.random() < saveChance) {
@@ -2359,8 +2410,15 @@ export const Interactive2DPitch: React.FC<Interactive2DPitchProps> = ({
       }
     };
 
-    animId = requestAnimationFrame(stepPhysics);
-    return () => cancelAnimationFrame(animId);
+    if (isMpHost) {
+      hostIntervalId = setInterval(stepPhysics, 16);
+    } else {
+      animId = requestAnimationFrame(stepPhysics);
+    }
+    return () => {
+      if (hostIntervalId) clearInterval(hostIntervalId);
+      if (animId !== null) cancelAnimationFrame(animId);
+    };
   }, [
     homeClub.name,
     homeClub.shortName,
